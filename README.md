@@ -1,7 +1,7 @@
 # DeepSeek-V4-Flash-Vision-Exp on 2× DGX Spark (SGLang)
 
 **Date:** 2026-09-04  
-**Last updated:** 2026-09-04 12:40 PT  
+**Last updated:** 2026-09-04 12:42 PT  
 **Hosts:** `gx10-30c1` (`192.168.1.68`) + `gx10-3fe8` (`192.168.1.67`)  
 **API:** `http://192.168.1.68:30000`  
 **Cookbook:** https://docs.sglang.io/cookbook/autoregressive/DeepSeek/DeepSeek-V4.md
@@ -39,6 +39,89 @@ This note dumps the full experiment path: official SGLang recipe → what broke 
 `deepseek_v4_vl.DeepseekV4ForCausalLM.load_weights` collected every non-vision tensor into a Python `list` before calling `language_model.load_weights`. On 128 GB UMA that peaks near **2×** weight footprint and the OS OOM-kills the scheduler (exit -9) after 48/48 shards, never reaching `Load weight end`.
 
 **Fix:** stream via a generator (see `overlay/deepseek_v4_vl.py`). After that, load end ≈ **74–76 GB/rank**, same ballpark as Flash-0731 text.
+
+---
+
+## Reproduce (external)
+
+Share this section with others. **Do not** depend on Anemll lab paths (`/Volumes/TB36/...`, `/home/anemll/...`, M3U, or LAN IPs).
+
+### 1. Download weights from Hugging Face
+
+Repo: [`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp)
+
+```bash
+# ~156G, 48 safetensor shards — pick YOUR local directory
+hf download deepseek-ai/DeepSeek-V4-Flash-Vision-Exp \
+  --local-dir ./DeepSeek-V4-Flash-Vision-Exp
+
+# integrity
+du -sh ./DeepSeek-V4-Flash-Vision-Exp
+ls ./DeepSeek-V4-Flash-Vision-Exp/model-*-of-00048.safetensors | wc -l   # expect 48
+```
+
+Copy that directory to **both** Spark nodes (or NFS-mount the same path on both). DSPARK needs **no** second download — draft weights load from this same checkpoint as `DeepseekV4ForCausalLMDSpark` (~5.5 GB).
+
+### 2. Pull the SGLang image (both nodes)
+
+```bash
+docker pull lmsysorg/sglang:dev-v4f-2dgx-v2
+```
+
+### 3. Install the stream `load_weights` overlay
+
+Stock VL loader OOMs on GB10 UMA (buffers the full LLM in a Python list). Use this repo’s patch:
+
+```bash
+# on each node (or shared filesystem)
+mkdir -p /path/to/sglang-vision-exp/overlay/models
+cp overlay/deepseek_v4_vl.py /path/to/sglang-vision-exp/overlay/models/
+cp scripts/run-v2-stream.sh /path/to/sglang-vision-exp/
+chmod +x /path/to/sglang-vision-exp/run-v2-stream.sh
+```
+
+Edit `run-v2-stream.sh` (or export env vars) so:
+
+| Variable | Meaning |
+| --- | --- |
+| `MODEL_HOST` | Absolute path to **your** Vision-Exp directory on that node |
+| `OVERLAY` | Directory that contains `models/deepseek_v4_vl.py` |
+| `DIST_ADDR` | Your head RDMA/IP `:25000` (recipe uses RoCE; match your fabric) |
+| Image / NCCL ifaces | Match your ConnectX / NIC names if they differ from the script defaults |
+
+### 4. Launch TP=2
+
+```bash
+# worker then head (or both quickly)
+./run-v2-stream.sh 1   # on worker, node-rank 1
+./run-v2-stream.sh 0   # on head, node-rank 0 — API on :30000
+```
+
+Wait for `The server is fired up and ready to roll!` (~10–15+ min: target ~74–76 GB/rank, then DSpark, then CUDA graphs).
+
+### 5. Smoke
+
+```bash
+curl -s http://HEAD:30000/v1/models
+
+curl -s http://HEAD:30000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"/models/DeepSeek-V4-Flash-Vision-Exp","messages":[{"role":"user","content":"Say hi"}],"max_tokens":32,"chat_template_kwargs":{"thinking":false}}'
+```
+
+Model id inside the container is `/models/DeepSeek-V4-Flash-Vision-Exp` (docker bind of `MODEL_HOST`).
+
+### Hard requirements / gotchas
+
+- Image **`lmsysorg/sglang:dev-v4f-2dgx-v2`** + **stream overlay** (required on GB10)
+- `--disable-shared-experts-fusion`, `--weight-loader-drop-cache-after-load`
+- Optional but used here: `--speculative-algorithm DSPARK`, `--tool-call-parser deepseekv4`, `--reasoning-parser deepseek-v4`
+- **Never** `--weight-loader-disable-mmap` on GB10 (host hang / hard reboot)
+- Non-v2 image cannot load Vision (`aligner` missing); thin VL overlays on non-v2 fail at runtime
+
+Cookbook: https://docs.sglang.io/cookbook/autoregressive/DeepSeek/DeepSeek-V4.md
+
+Lab-only layout (Anemll TB36 / Spark absolute paths) lives in [Model inventory](#model-inventory-tb36--sparks) and [Redeploy later](#redeploy-later-working-path) below — skip those when sharing.
 
 ---
 
@@ -303,6 +386,8 @@ Upstream: worth filing against `sgl-project/sglang` / Spark Vision recipe — co
 
 ## Model inventory (TB36 + Sparks)
 
+> **Lab-only.** External reproduce uses the HF download above, not these paths.
+
 Verified **2026-09-04 12:40 PT** from M3U (`192.168.1.38`). TB36 is the TrueNAS SMB share `//streambox@truenas…/TB36` mounted at `/Volumes/TB36` (not on M5 unless you mount it there).
 
 ### Required for this Vision serve
@@ -350,6 +435,8 @@ done
 ---
 
 ## Redeploy later (working path)
+
+> **Lab-only** (Anemll Sparks / TB36). For sharing, use [Reproduce (external)](#reproduce-external).
 
 Assumes weights already on both Sparks (or re-rsync from TB36 first).
 
