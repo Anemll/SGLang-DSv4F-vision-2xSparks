@@ -1,0 +1,4 @@
+# Lab-only absolute paths (NAS / Mac / Spark) — do not publish
+LAB.md
+*.lab.md
+local/
